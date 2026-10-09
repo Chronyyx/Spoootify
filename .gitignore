@@ -1,0 +1,11 @@
+dist/
+*.pem
+*.key
+.spoootify/
+watch.log
+watch.log.old
+watch.pid
+.update/
+.previous/
+node_modules/
+yo.txt

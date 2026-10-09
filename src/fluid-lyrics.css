@@ -1,0 +1,341 @@
+/*
+ * Fluid Lyrics — styles.
+ * Rule of thumb used throughout: anything that moves animates ONLY transform / opacity
+ * (and filter on a handful of composited layers). Those run on the compositor thread,
+ * so Spotify's main thread can be pegged by React and the lyrics still glide.
+ */
+
+:root {
+  --fl-accent: #1ed760;
+  --fl-spring: cubic-bezier(.22, 1, .36, 1); /* replaced at runtime by a physically-derived linear() spring */
+  --fl-scroll-ms: 820ms;
+  --fl-feather: .7em;
+  --fl-dim: .38;
+}
+
+/* native lyrics button reflects our state */
+html.fl-open [data-testid="lyrics-button"], html.fl-open [data-fl-open] { color: var(--fl-accent) !important; }
+[data-fl-open] { position: relative; }
+html.fl-open [data-testid="lyrics-button"]::after {
+  content: ""; position: absolute; bottom: -2px; left: 50%; width: 4px; height: 4px; margin-left: -2px;
+  border-radius: 50%; background: var(--fl-accent);
+}
+
+/* ───────────────── shell ───────────────── */
+#fl-root {
+  position: fixed;
+  left: var(--fl-x, 8px);
+  top: var(--fl-y, 64px);
+  width: var(--fl-w, calc(100vw - 16px));
+  height: var(--fl-h, calc(100vh - 152px));
+  z-index: 90;
+  border-radius: 8px;
+  overflow: hidden;
+  contain: strict;
+  isolation: isolate;
+  container-type: size;
+  container-name: fl;
+  background: #121216;
+  color: #fff;
+  font-family: SpotifyMixUI, SpotifyMixUI-Arab, SpotifyMixUI-Cyrl, SpotifyMixUI-Grek, SpotifyMixUI-Hebr, SpotifyMixUI-Thai,
+    "Helvetica Neue", helvetica, arial, "Hiragino Sans", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(14px) scale(.985);
+  transition: opacity .22s ease, transform .5s var(--fl-spring), visibility 0s linear .5s;
+  pointer-events: none;
+}
+#fl-root.is-open {
+  opacity: 1;
+  visibility: visible;
+  transform: none;
+  transition: opacity .2s ease, transform .55s var(--fl-spring), visibility 0s;
+  pointer-events: auto;
+}
+
+/* ───────────────── background ───────────────── */
+#fl-bg, .fl-bg-fallback {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  z-index: 0;
+}
+#fl-bg { image-rendering: auto; }
+.fl-bg-fallback { overflow: hidden; display: none; }
+#fl-root.bg-css #fl-bg { display: none; }
+#fl-root.bg-css .fl-bg-fallback { display: block; }
+.fl-bg-fallback i {
+  /* fallback: small blurred layers scaled up (blur cost is paid at 1/4 size), rotated on the compositor */
+  position: absolute; left: 50%; top: 50%; width: 50%; aspect-ratio: 1;
+  background: var(--fl-art) center / cover;
+  filter: blur(24px) saturate(1.6);
+  border-radius: 50%;
+  will-change: transform;
+  animation: fl-spin var(--d) linear infinite;
+}
+.fl-bg-fallback i:nth-child(1) { --d: 70s; --s: 4.2; translate: -60% -55%; }
+.fl-bg-fallback i:nth-child(2) { --d: 95s; --s: 3.4; translate: -20% -40%; animation-direction: reverse; }
+.fl-bg-fallback i:nth-child(3) { --d: 120s; --s: 3.8; translate: -55% -10%; }
+#fl-root:not(.is-open) .fl-bg-fallback i { animation-play-state: paused; }
+@keyframes fl-spin { from { transform: scale(var(--s)) rotate(0turn); } to { transform: scale(var(--s)) rotate(1turn); } }
+
+.fl-scrim {
+  position: absolute; inset: 0; z-index: 1; pointer-events: none;
+  background:
+    radial-gradient(120% 90% at 30% 40%, transparent 35%, rgba(0, 0, 0, .3)),
+    linear-gradient(rgba(0, 0, 0, .2), rgba(0, 0, 0, .28));
+}
+/* static film grain hides 8-bit banding of the upscaled gradient (rasterised once) */
+.fl-grain {
+  position: absolute; inset: 0; z-index: 1; pointer-events: none; opacity: .07; mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* ───────────────── layout ───────────────── */
+.fl-stage {
+  position: absolute; inset: 0; z-index: 2;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.fl-head {
+  display: flex; align-items: center; gap: 14px;
+  padding: 22px 26px 6px 32px;
+  min-width: 0;
+}
+.fl-art {
+  width: 56px; height: 56px; flex: none;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .08) center / cover;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, .35);
+}
+.fl-meta { min-width: 0; flex: 1; }
+.fl-title, .fl-artist { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fl-title { font-weight: 700; font-size: 17px; letter-spacing: -.01em; }
+.fl-artist { font-size: 15px; color: rgba(255, 255, 255, .62); margin-top: 1px; }
+/* own stacking layer: the lyrics scroller comes later in the DOM and is positioned, so without
+   this it paints over the buttons and swallows their clicks */
+.fl-actions { display: flex; gap: 8px; flex: none; position: relative; z-index: 4; }
+
+.fl-btn {
+  appearance: none; border: 0; padding: 0; margin: 0;
+  width: 36px; height: 36px; border-radius: 50%;
+  display: grid; place-items: center;
+  color: #fff;
+  background: rgba(255, 255, 255, .14);
+  cursor: pointer;
+  transition: transform .18s var(--fl-spring), background-color .15s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+.fl-btn svg { width: 18px; height: 18px; display: block; }
+.fl-btn:hover { background: rgba(255, 255, 255, .22); }
+/* instant press feedback: applied on pointerdown, not after the click round-trip */
+.fl-btn:active, .fl-btn.is-pressed { transform: scale(.88); transition-duration: .06s; }
+.fl-btn:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+/* wide windows: Apple Music desktop arrangement — art & meta left, lyrics right */
+@container fl (min-width: 1080px) and (min-height: 440px) {
+  .fl-stage { grid-template-columns: minmax(300px, 38%) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+  .fl-head {
+    flex-direction: column; align-items: flex-start; justify-content: center; gap: 0;
+    padding: 0 0 0 clamp(40px, 6cqw, 110px);
+  }
+  .fl-art { width: min(30cqw, 52cqh, 400px); height: auto; aspect-ratio: 1; border-radius: 10px; box-shadow: 0 24px 60px rgba(0, 0, 0, .45); }
+  .fl-meta { flex: none; width: min(30cqw, 52cqh, 400px); margin-top: 22px; }
+  .fl-title { font-size: 22px; }
+  .fl-artist { font-size: 18px; margin-top: 3px; }
+  .fl-actions { position: absolute; top: 18px; right: 20px; z-index: 4; }
+}
+
+/* ───────────────── lyrics ───────────────── */
+.fl-scroller {
+  /* bleed room: the clip box extends past the text column so glows on held words and the
+     line hover background aren't cut at the column's edges; .fl-lines is inset to match */
+  --fl-bleed: 40px;
+  margin-inline: calc(-1 * var(--fl-bleed));
+  position: relative; min-height: 0; overflow: hidden;
+  -webkit-mask-image: linear-gradient(transparent 0, #000 9%, #000 78%, transparent 100%);
+  cursor: default;
+}
+.fl-lines {
+  position: absolute; left: var(--fl-bleed); right: var(--fl-bleed); top: 0;
+  padding: 0 clamp(28px, 5cqw, 80px) 50cqh clamp(32px, 4cqw, 64px);
+  font-family: SpotifyMixUITitle, SpotifyMixUI, SpotifyMixUI-Arab, SpotifyMixUI-Cyrl, SpotifyMixUI-Grek, SpotifyMixUI-Hebr,
+    "Helvetica Neue", helvetica, arial, "Hiragino Sans", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif;
+  font-weight: 800;
+  font-size: clamp(26px, min(3.4cqw, 6.2cqh), 54px);
+  line-height: 1.16;
+  letter-spacing: -.018em;
+  max-width: 17em;
+}
+@container fl (min-width: 1080px) and (min-height: 440px) {
+  .fl-lines { font-size: clamp(30px, min(2.75cqw, 6.4cqh), 58px); padding-left: 0; }
+}
+
+/*
+ * Per-line scroll state is written by JS as *non-inheriting* registered properties:
+ * changing them restyles only the line element, never its thousands of word spans.
+ */
+@property --fl-y { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --fl-d { syntax: "<number>"; inherits: false; initial-value: 0; }
+@property --fl-k { syntax: "<number>"; inherits: false; initial-value: 0; }
+
+.fl-line {
+  position: relative;
+  padding: .3em .2em;
+  margin-left: -.2em;
+  border-radius: .25em;
+  transform: translateY(var(--fl-y));
+  transform-origin: 0 50%;
+  /* Apple-style cascade: lines below the focused one follow with a small stagger */
+  /* filter is deliberately NOT transitioned: blur transitions can't run on the compositor */
+  transition:
+    transform var(--fl-scroll-ms) var(--fl-spring) calc(var(--fl-k) * 42ms),
+    opacity .5s ease;
+  opacity: max(.45, 1 - var(--fl-d) * .1);
+  filter: blur(calc(min(var(--fl-d), 5) * .6px));
+  /* no permanent will-change: 80 promoted lines made every frame's layerization expensive.
+     Lines get promoted automatically only while their transform transition runs. */
+  cursor: pointer;
+  contain: layout style;
+}
+.fl-line.is-active { opacity: 1; filter: none; }
+.fl-line:hover { background: rgba(255, 255, 255, .05); }
+#fl-root.no-blur .fl-line { filter: none; }
+/* while the user scrolls by hand: no blur, no stagger, quick follow */
+#fl-root.is-manual .fl-line { filter: none; opacity: .9; transition: transform .28s cubic-bezier(.2, .8, .2, 1), opacity .3s; }
+#fl-root.is-manual .fl-line.is-active { opacity: 1; }
+
+.fl-main, .fl-bgv { display: block; word-spacing: .14em; } /* the title face's space glyph is very narrow */
+.fl-bgv { font-size: .62em; font-weight: 700; margin-top: .25em; letter-spacing: -.005em; }
+.fl-bgv .fl-b { color: rgba(255, 255, 255, calc(var(--fl-dim) * .9)); }
+.fl-line.side-bg .fl-main { font-size: .72em; font-weight: 700; }
+.fl-line[dir="rtl"] { text-align: right; }
+
+/* a word = dim base text + a bright copy revealed by two counter-translating layers */
+.fl-w {
+  position: relative;
+  display: inline-block;
+  white-space: pre;
+  /* lift + glow are animated on the compositor */
+  transform-origin: 50% 80%;
+}
+.fl-b { color: rgba(255, 255, 255, var(--fl-dim)); }
+.fl-f {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  width: calc(100% + var(--fl-feather));
+  overflow: hidden;
+  pointer-events: none;
+  transform: translateX(-100%);
+  -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - var(--fl-feather)), transparent);
+  /* Never opacity:0 by default. Chromium refuses to composite animations whose target is
+     invisible at creation (kAnimationHasNoVisibleChange) and ticks them on the main thread
+     for their whole life. The layer is hidden purely by its translate(-100%) instead. */
+}
+.fl-fi { display: block; width: 100%; color: #fff; transform: translateX(100%); white-space: pre; }
+.fl-line[dir="rtl"] .fl-f { left: auto; right: 0; transform: translateX(100%); -webkit-mask-image: linear-gradient(270deg, #000 calc(100% - var(--fl-feather)), transparent); }
+.fl-line[dir="rtl"] .fl-fi { transform: translateX(-100%); text-align: right; }
+.fl-line.is-done .fl-f { opacity: 0; transition: opacity .55s ease; }
+
+.fl-l { display: inline-block; white-space: pre; transform-origin: 50% 85%; }
+.fl-gl {
+  position: absolute; inset: 0; pointer-events: none;
+  color: transparent;
+  text-shadow: 0 0 .32em rgba(255, 255, 255, .85), 0 0 .08em rgba(255, 255, 255, .6);
+  opacity: 0;
+  white-space: pre;
+}
+
+/* instrumental break — breathing dots */
+.fl-gap {
+  height: 1.15em;
+  display: flex; align-items: center; gap: .24em;
+  /* same inset as text lines (which offset their -.2em hover margin): otherwise the first dot
+     starts outside the scroller's clip box and gets cut in half */
+  padding-left: .2em;
+  cursor: default;
+}
+.fl-gap .fl-dots { display: flex; gap: .24em; transform: scale(0); transform-origin: 0 50%; transition: transform .5s var(--fl-spring); }
+.fl-gap.is-active .fl-dots { transform: scale(1); }
+.fl-gap.is-active .fl-dots-in { animation: fl-breathe 3.6s ease-in-out infinite; }
+.fl-dots-out { display: flex; transform-origin: 0 50%; }
+.fl-dots-in { display: flex; gap: .24em; transform-origin: 0 50%; }
+.fl-dot { width: .3em; height: .3em; border-radius: 50%; background: #fff; opacity: var(--fl-dim); }
+@keyframes fl-breathe { 0%, 100% { transform: scale(.94); } 50% { transform: scale(1.12); } }
+
+/* "back to the current line" pill — only while the user has scrolled away */
+.fl-sync {
+  position: absolute; left: 50%; bottom: 22px; z-index: 3;
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 16px 0 12px; height: 38px; border: 0; border-radius: 19px;
+  font: 700 14px/1 SpotifyMixUI, "Helvetica Neue", helvetica, arial, sans-serif; color: #fff;
+  background: rgba(255, 255, 255, .18);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, .25), inset 0 0 0 1px rgba(255, 255, 255, .12);
+  cursor: pointer;
+  opacity: 0; visibility: hidden; pointer-events: none;
+  transform: translate(-50%, 10px) scale(.96);
+  transition: opacity .18s ease, transform .4s var(--fl-spring), visibility 0s .4s, background-color .15s ease;
+}
+.fl-sync svg { width: 16px; height: 16px; }
+.fl-sync:hover { background: rgba(255, 255, 255, .26); }
+.fl-sync:active, .fl-sync.is-pressed { transform: translate(-50%, 0) scale(.94); transition-duration: .06s; }
+#fl-root.is-manual .fl-sync {
+  opacity: 1; visibility: visible; pointer-events: auto;
+  transform: translateX(-50%);
+  transition: opacity .18s ease, transform .45s var(--fl-spring), visibility 0s, background-color .15s ease;
+}
+
+/* static (unsynced) lyrics: native scrolling */
+#fl-root.is-static .fl-scroller { overflow-y: auto; scrollbar-width: none; }
+#fl-root.is-static .fl-lines { position: relative; padding-top: 6cqh; }
+#fl-root.is-static .fl-line { transform: none; filter: none; opacity: .92; cursor: default; transition: none; }
+#fl-root.is-static .fl-b { color: rgba(255, 255, 255, .9); }
+
+/* status message */
+.fl-msg {
+  position: absolute; inset: 0; display: grid; place-items: center; text-align: center;
+  font-size: 22px; font-weight: 700; color: rgba(255, 255, 255, .7);
+  opacity: 0; transition: opacity .3s ease; pointer-events: none;
+}
+.fl-msg.is-shown { opacity: 1; }
+.fl-msg small { display: block; font-size: 14px; font-weight: 400; margin-top: 6px; color: rgba(255, 255, 255, .5); }
+
+/* ───────────────── settings popover ───────────────── */
+.fl-pop {
+  position: absolute; top: 64px; right: 20px; z-index: 5;
+  width: 260px; padding: 8px;
+  border-radius: 12px;
+  background: rgba(28, 28, 32, .94);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, .5), inset 0 0 0 1px rgba(255, 255, 255, .08);
+  font-size: 13px;
+  transform-origin: calc(100% - 22px) -6px;
+  opacity: 0; transform: scale(.92); visibility: hidden; pointer-events: none;
+  transition: opacity .14s ease, transform .3s var(--fl-spring), visibility 0s .3s;
+}
+.fl-pop.is-open { opacity: 1; transform: none; visibility: visible; pointer-events: auto; transition: opacity .12s ease, transform .32s var(--fl-spring), visibility 0s; }
+@container fl (min-width: 1080px) and (min-height: 440px) { .fl-pop { top: 62px; } }
+.fl-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border-radius: 8px; }
+.fl-row + .fl-row { margin-top: 2px; }
+.fl-row label { color: rgba(255, 255, 255, .85); }
+.fl-src { color: rgba(255, 255, 255, .5); font-size: 12px; padding: 6px 10px 4px; line-height: 1.4; }
+.fl-src b { color: rgba(255, 255, 255, .8); font-weight: 600; }
+.fl-step { display: flex; align-items: center; gap: 4px; }
+.fl-step output { min-width: 58px; text-align: center; font-variant-numeric: tabular-nums; color: #fff; }
+.fl-step .fl-btn { width: 28px; height: 28px; font-size: 16px; line-height: 1; }
+.fl-tog {
+  appearance: none; width: 36px; height: 20px; border-radius: 10px; margin: 0; flex: none;
+  background: rgba(255, 255, 255, .25); position: relative; cursor: pointer;
+  transition: background-color .15s ease;
+}
+.fl-tog::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff;
+  transition: transform .25s var(--fl-spring);
+}
+.fl-tog:checked { background: var(--fl-accent); }
+.fl-tog:checked::after { transform: translateX(16px); }
+
+@media (prefers-reduced-motion: reduce) {
+  .fl-line { transition: opacity .3s; }
+  .fl-gap.is-active .fl-dots-in { animation: none; }
+}
