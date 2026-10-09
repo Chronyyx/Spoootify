@@ -167,8 +167,8 @@
             <button class="fl-btn" data-act="close" aria-label="Close lyrics">${ICON.close}</button>
           </div>
         </div>
-        <div class="fl-scroller"><div class="fl-lines" role="list"></div><div class="fl-msg" aria-live="polite"></div>
-          <button class="fl-sync fl-btn-pill" data-act="resync" aria-label="Back to the current line">${ICON.sync}<span>Back to lyrics</span></button></div>
+        <div class="fl-scroller"><div class="fl-lines" role="list"></div><div class="fl-msg" aria-live="polite"></div></div>
+        <button class="fl-sync fl-btn-pill" data-act="resync" aria-label="Back to the current line">${ICON.sync}<span>Back to lyrics</span></button>
       </div>
       <div class="fl-pop" role="menu">
         <div class="fl-row"><label>Sync offset</label><div class="fl-step">
