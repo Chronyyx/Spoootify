@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /*
- * Spoootify background helper. Started hidden at logon (see setup.mjs). Two jobs:
+ * Spoootify background helper. Started hidden at logon (see setup.mjs). Two jobs, plus the
+ * local lyrics relay (lyrics-proxy.mjs) that lets the viewer reach non-CORS lyrics databases:
  *
  * 1. Auto-update: shortly after boot and every few hours, check the GitHub release; if a newer
  *    *signed* release exists, swap it in (update.mjs), re-inject, and restart this helper.
@@ -21,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { isInjected } from './zip.mjs';
 import { checkForUpdate, localVersion } from './update.mjs';
 import { NAME, UPDATE_EVERY_MS } from './config.mjs';
+import { startLyricsProxy } from './lyrics-proxy.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DIR = path.resolve(HERE, '..');
@@ -135,6 +137,7 @@ async function updateCycle(reason) {
 }
 
 log(`helper started (pid ${process.pid}, version ${localVersion(DIR)})`);
+startLyricsProxy(log);
 setTimeout(() => updateCycle('boot'), 20000); // give the network a moment after logon
 setInterval(() => updateCycle('periodic'), UPDATE_EVERY_MS);
 watchApps();

@@ -82,7 +82,45 @@ function lrclib(track) {
     album_name: track.album || '',
     duration: String(Math.round(track.durationMs / 1000)),
   });
-  return getJSON('https://lrclib.net/api/get?' + q, { 'Lrclib-Client': 'FluidLyrics/1.0' }, 6000);
+  const H = { 'Lrclib-Client': 'FluidLyrics/1.0' };
+  // the exact lookup misses when Spotify's album/duration differ slightly from LRCLIB's entry
+  // (and it 503s now and then), so fall back to a search ranked by artist, sync and duration
+  return getJSON('https://lrclib.net/api/get?' + q, H, 6000).then(async (hit) => {
+    if (hit && (hit.syncedLyrics || hit.plainLyrics || hit.instrumental)) return hit;
+    const list = await getJSON('https://lrclib.net/api/search?' + new URLSearchParams({ track_name: track.name, artist_name: track.artists[0] || '' }), H, 6000);
+    if (!Array.isArray(list)) return hit;
+    const norm = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[^\p{L}\p{N}]+/gu, '');
+    const name = norm(track.name), artist = norm(track.artists[0]), dur = track.durationMs / 1000;
+    let best = null, bestScore = -1;
+    for (const c of list) {
+      if (norm(c.trackName) !== name || !norm(c.artistName).includes(artist)) continue;
+      const off = Math.abs((c.duration || 0) - dur);
+      if (off > 4) continue;
+      const score = (c.syncedLyrics ? 10 : c.plainLyrics ? 5 : 0) - off;
+      if (score > bestScore) { best = c; bestScore = score; }
+    }
+    return best || hit;
+  });
+}
+
+// NetEase Cloud Music sends no CORS headers, so it is queried through the Spoootify helper's
+// local relay (tools/lyrics-proxy.mjs). No helper running → connection refused → null, fast.
+function netease(track) {
+  return getJSON('http://127.0.0.1:47321/v1/netease?' + new URLSearchParams({
+    track: track.name,
+    artist: track.artists[0] || '',
+    duration: String(Math.round(track.durationMs / 1000)),
+  }), {}, 12000);
+}
+
+// last resort: plain (unsynced) lyrics
+async function lyricsOvh(track) {
+  if (!track.artists[0]) return null;
+  const j = await getJSON(`https://api.lyrics.ovh/v1/${encodeURIComponent(track.artists[0])}/${encodeURIComponent(track.name)}`, {}, 7000);
+  if (!j || typeof j.lyrics !== 'string') return null;
+  // the API sometimes prefixes a French "Paroles de la chanson … par …" header line
+  const text = j.lyrics.replace(/\r\n?/g, '\n').replace(/^Paroles de la chanson .*\n/, '').trim();
+  return text || null;
 }
 
 async function audioAnalysis(track, token) {
@@ -149,11 +187,15 @@ async function build(track, token, opts) {
 
   // 2) Spotify lyrics (line synced, occasionally syllable synced)
   const L = sp && sp.lyrics;
+  let spStatic = null; // Spotify's unsynced text: used only if no other source has timing
   if (L && Array.isArray(L.lines) && L.lines.length) {
     const provider = 'Spotify' + (L.providerDisplayName ? ' · ' + L.providerDisplayName : '');
     if (L.syncType === 'UNSYNCED') {
-      return { kind: 'static', source: provider, sync: 'static', items: L.lines.map((l) => ({ t: 'line', text: l.words || '' })) };
+      spStatic = { kind: 'static', source: provider, sync: 'static', items: L.lines.map((l) => ({ t: 'line', text: l.words || '' })) };
     }
+  }
+  if (L && !spStatic && Array.isArray(L.lines) && L.lines.length) {
+    const provider = 'Spotify' + (L.providerDisplayName ? ' · ' + L.providerDisplayName : '');
     const raw = L.lines.map((l) => ({
       start: +l.startTimeMs,
       end: +l.endTimeMs || 0,
@@ -175,10 +217,27 @@ async function build(track, token, opts) {
     if (lf) attachEnds(raw, lf);
     if (raw.length) return finalize(synthesize(raw, track, onsets), track, 'LRCLIB', onsets ? 'smart+audio' : 'smart');
   }
-  if (lrc && lrc.plainLyrics) {
-    return { kind: 'static', source: 'LRCLIB', sync: 'static', items: lrc.plainLyrics.split('\n').map((t) => ({ t: 'line', text: t })) };
+
+  // 4) NetEase Cloud Music via the helper's relay — asked only when nobody above had timing
+  const ne = wantLrc ? await netease(track) : null;
+  if (ne && typeof ne.yrc === 'string' && ne.yrc.trim()) {
+    const lines = parseYRC(ne.yrc);
+    if (lines.some((l) => l.words.length)) return finalize(lines, track, 'NetEase', 'word');
   }
+  if (ne && typeof ne.lrc === 'string') {
+    const raw = dropCredits(parseLRC(ne.lrc));
+    if (raw.some((r) => r.start > 0) && raw.filter((r) => r.text).length >= 3) {
+      return finalize(synthesize(raw, track, onsets), track, 'NetEase', onsets ? 'smart+audio' : 'smart');
+    }
+  }
+
+  // 5) unsynced text, best source first
+  const plain = (src, text) => ({ kind: 'static', source: src, sync: 'static', items: text.split('\n').map((t) => ({ t: 'line', text: t })) });
+  if (spStatic) return spStatic;
+  if (lrc && lrc.plainLyrics) return plain('LRCLIB', lrc.plainLyrics);
   if (lrc && lrc.instrumental) return { kind: 'none', reason: 'instrumental' };
+  const ovh = wantLrc ? await lyricsOvh(track) : null;
+  if (ovh) return plain('lyrics.ovh', ovh);
   return { kind: 'none', reason: 'missing' };
 }
 
@@ -202,6 +261,46 @@ function parseLRC(src) {
     for (const st of stamps) out.push({ start: st, end: 0, text });
   }
   return out.sort((a, b) => a.start - b.start);
+}
+
+// NetEase prefixes lyrics with credit lines ("作词 : …", "Producer : …") — not sung, drop them
+const CREDIT = /^\s*(?:[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\s/]{1,12}|(?:lyrics|lyricist|written|writer|composer|composed|producer|produced|arranger|arranged|mix(?:ed|ing)?|master(?:ed|ing)?|engineer|recorded|vocals?|music|words)(?:\s+by)?)\s*[:：]/iu;
+function dropCredits(raw) {
+  return raw.filter((r) => !CREDIT.test(r.text));
+}
+
+// NetEase word-synced "yrc":  [lineStartMs,lineDurMs](wordStartMs,wordDurMs,0)text(…)text…
+// (lines starting with "{" are JSON credit blobs)
+function parseYRC(src) {
+  const lines = [];
+  for (const row of src.split(/\r?\n/)) {
+    const m = row.match(/^\[(\d+),(\d+)\](.*)$/);
+    if (!m) continue;
+    const parts = m[3].split(/\((\d+),(\d+),\d+\)/); // ['', s, d, text, s, d, text, …]
+    const words = [];
+    let cur = null;
+    for (let i = 1; i + 2 < parts.length; i += 3) {
+      const s = +parts[i], e = s + Math.max(+parts[i + 1], MIN_SYL_MS), piece = parts[i + 2];
+      const t = piece.trim();
+      if (!t) { cur = null; continue; }
+      // English yrc is one chunk per word, but its spaces are unreliable ("how(…)to " →
+      // "howto"), so every chunk starts a word — except bare punctuation, and CJK characters
+      // following CJK (those are per-character syllables of one unspaced run)
+      const prev = cur && cur.syl[cur.syl.length - 1].text;
+      const glue = cur && !/^\s/.test(piece) &&
+        (!/[\p{L}\p{N}]/u.test(t) || (CJK.test(t) && CJK.test(prev.slice(-1))));
+      if (!glue) {
+        cur = { syl: [] };
+        words.push(cur);
+      }
+      cur.syl.push({ text: t, s, e });
+      if (/\s$/.test(piece)) cur = null; // trailing space closes the word
+    }
+    const text = words.map((w) => w.syl.map((x) => x.text).join('')).join(' ');
+    if (CREDIT.test(text)) continue;
+    lines.push({ start: words.length ? words[0].syl[0].s : +m[1], text, words: words.map(toWord) });
+  }
+  return lines.sort((a, b) => a.start - b.start);
 }
 
 /**

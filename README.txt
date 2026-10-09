@@ -27,6 +27,8 @@ UNINSTALL
 
 NOTES
   - Only works with Spotify from spotify.com (the Microsoft Store version can't be modified).
-  - Lyrics come from Spotify (your own login) and LRCLIB. Word timing is estimated when no
-    word-synced lyrics exist.
+  - Lyrics come from Spotify (your own login), then LRCLIB, NetEase Cloud Music and
+    lyrics.ovh as fallbacks. Word timing is estimated when no word-synced lyrics exist.
+  - The background helper serves the NetEase lookup on 127.0.0.1 (local only, answers
+    only Spotify's own page).
   - Modding the Spotify client is against Spotify's terms of use. Use at your own discretion.

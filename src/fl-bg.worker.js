@@ -1,14 +1,14 @@
 /*
  * Fluid Lyrics — living album-art background (runs in a dedicated Worker).
  *
- * The page hands us an OffscreenCanvas; we render a domain-warped, slowly rotating
- * multi-layer blend of the album cover with WebGL2. Nothing here touches the UI thread:
- * even if Spotify's React tree is busy re-rendering, the background keeps flowing.
+ * The page hands us an OffscreenCanvas; we render two slowly rotating, stretched copies of
+ * the album cover bent by a smooth sine flow (long liquid streaks) with WebGL2. Nothing here
+ * touches the UI thread: even if Spotify's React tree is busy re-rendering, the background
+ * keeps flowing.
  *
  * Cost control:
- *  - the canvas is rendered at ~1/8 of the CSS size and upscaled by the compositor
- *    (the image is a blur anyway — bilinear upscaling *is* the blur, for free)
- *  - the cover is uploaded as a pre-blurred 40×40 texture, so there is no blur pass at all
+ *  - the canvas is rendered at ~1/4 of the CSS size and upscaled by the compositor
+ *  - the cover is uploaded as a pre-blurred 96×96 texture, so there is no blur pass at all
  *  - 30 fps cap (motion is slow; 60 fps would be indistinguishable)
  *  - the loop fully stops when the viewer is hidden
  */
@@ -33,30 +33,38 @@ uniform sampler2D uA, uB; uniform float uMix, uT; uniform vec2 uRes;
 
 vec2 rot(vec2 p, float a){ float c=cos(a), s=sin(a); return mat2(c,-s,s,c)*p; }
 float h(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
-float n(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
-  return mix(mix(h(i),h(i+vec2(1,0)),f.x), mix(h(i+vec2(0,1)),h(i+vec2(1,1)),f.x), f.y); }
-float fbm(vec2 p){ float v=0., a=.5; for(int i=0;i<4;i++){ v+=a*n(p); p=p*2.03+17.1; a*=.5; } return v; }
 
+// smooth low-frequency flow (stacked sine shears): bends the cover into long liquid
+// streaks without the fine-grained noise that turned it into mush
+vec2 flow(vec2 p, float t){
+  for (int i = 1; i < 4; i++) {
+    float f = float(i);
+    p.x += .30 / f * sin(f * 1.2 * p.y + t * .07 * f + 1.7 * f);
+    p.y += .24 / f * cos(f * 1.0 * p.x - t * .06 * f + .6 * f);
+  }
+  return p;
+}
+
+// two big rotating copies of the cover, each stretched along a slowly turning axis so its
+// shapes smear into streaks, blended by a soft moving field (not averaged → stays vivid)
 vec3 layers(sampler2D tex, vec2 w, float t){
-  vec3 c = texture(tex, rot(w*.85, t*.021) + .5).rgb * .34;
-  c += texture(tex, rot(w*1.35 + vec2(.22,-.16), -t*.031 + 1.3) + .5).rgb * .26;
-  c += texture(tex, rot(w*.62 - vec2(.18,.27), t*.016 + 2.1) + .5).rgb * .22;
-  c += texture(tex, rot(w*1.8 + vec2(-.31,.12), -t*.026 + 4.2) + .5).rgb * .18;
-  return c;
+  vec2 a = rot(w, t * .018); a.x *= .42;
+  vec2 b = rot(w + vec2(.15, -.1), -t * .014 + 2.2); b.y *= .5;
+  vec3 c1 = texture(tex, rot(a, -t * .018) * .9 + .5).rgb;
+  vec3 c2 = texture(tex, rot(b, t * .011 + 1.1) * 1.1 + .5).rgb;
+  float k = smoothstep(.15, .85, .5 + .5 * sin(w.x * 1.3 + w.y * .8 + t * .045));
+  return mix(c1, c2, k);
 }
 
 void main(){
   float t = uT;
   vec2 p = uv - .5; p.x *= uRes.x / uRes.y;
-  // two-level domain warp → liquid, slowly "breathing" distortion
-  vec2 q = vec2(fbm(p*1.25 + t*.035), fbm(p*1.25 - t*.028 + 4.7));
-  vec2 r = vec2(fbm(p*1.6 + q*1.7 + t*.02 + 1.7), fbm(p*1.6 + q*1.7 - t*.024 + 9.2));
-  vec2 w = p + (r - .5) * .62;
+  vec2 w = flow(p * 1.1, t) * .9;
   vec3 c = layers(uB, w, t);
   if (uMix < 1.) c = mix(layers(uA, w, t), c, smoothstep(0.,1.,uMix));
   // vibrancy: boost saturation, compress highlights so white text always reads
   float l = dot(c, vec3(.2126,.7152,.0722));
-  c = mix(vec3(l), c, 1.45);
+  c = mix(vec3(l), c, 1.3);
   c = c * .78 / (1. + c * .35);
   c *= 1. - .28 * dot(p, p);                 // soft vignette
   c += (h(uv*uRes + fract(t)) - .5) / 255.;  // dither against 8-bit banding
@@ -146,9 +154,9 @@ function makeTex() {
 
 function resize(w, h) {
   if (!gl) return;
-  // ~1/8 resolution: the compositor's bilinear upscale is our blur
-  canvas.width = Math.max(32, Math.round(w / 8));
-  canvas.height = Math.max(32, Math.round(h / 8));
+  // ~1/4 resolution: the field is smooth, so the compositor's bilinear upscale hides it
+  canvas.width = Math.max(32, Math.round(w / 4));
+  canvas.height = Math.max(32, Math.round(h / 4));
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.uniform2f(U.uRes, canvas.width, canvas.height);
   if (!running) draw(performance.now());
@@ -160,14 +168,14 @@ async function loadArt(url) {
   try {
     const r = await fetch(url);
     const blob = await r.blob();
-    // decode straight to 40×40 — the downscale averages detail away (= pre-blur)
-    const bmp = await createImageBitmap(blob, { resizeWidth: 40, resizeHeight: 40, resizeQuality: 'medium' });
+    // decode straight to 96×96 — enough to keep the cover's shapes, small enough to be cheap
+    const bmp = await createImageBitmap(blob, { resizeWidth: 96, resizeHeight: 96, resizeQuality: 'high' });
     if (seq !== artSeq) return bmp.close();
-    // extra softening pass on a tiny 2D canvas so texels blend without blocky edges
-    const oc = new OffscreenCanvas(40, 40);
+    // softening pass on a small 2D canvas: shapes keep soft edges instead of hard texel steps
+    const oc = new OffscreenCanvas(96, 96);
     const cx = oc.getContext('2d');
-    cx.filter = 'blur(2px) saturate(1.15)';
-    cx.drawImage(bmp, -4, -4, 48, 48);
+    cx.filter = 'blur(3px) saturate(1.15)';
+    cx.drawImage(bmp, -8, -8, 112, 112);
     bmp.close();
     // swap: current B becomes A, new cover goes into B and cross-fades in
     [texA, texB] = [texB, texA];

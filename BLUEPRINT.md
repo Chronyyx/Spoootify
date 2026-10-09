@@ -27,7 +27,12 @@ Spotify 1.3.x keeps almost all of its JS in a V8 startup snapshot. There's no re
 
 Data comes from:
 - lyrics: `spclient …/color-lyrics/v2` (line-synced)
-- true word timing, when it exists: LRCLIB (enhanced LRC or `lyricsfile` word entries)
+- true word timing, when it exists: LRCLIB (enhanced LRC or `lyricsfile` word entries), NetEase `yrc`
+- fallbacks, in order, when Spotify has no timed lyrics:
+  1. LRCLIB exact lookup, then LRCLIB search ranked by name, artist, sync and duration (±4 s)
+  2. NetEase Cloud Music (line `lrc` or word `yrc`, credit lines dropped). NetEase sends no CORS headers, so the background helper relays it from `127.0.0.1:47321` (`tools/lyrics-proxy.mjs`): one fixed route, and it answers only the `xpui.app.spotify.com` origin
+  3. unsynced text from Spotify, LRCLIB, then lyrics.ovh
+- Spotify disables its lyrics button on songs it has no lyrics for. The runtime re-enables it so those songs can still open the viewer.
 - note-onset segments and tatums: `spclient …/audio-attributes/v1/audio-analysis`
 
 ## 2. Solving word-level timing

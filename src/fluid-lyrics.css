@@ -28,7 +28,7 @@ html.fl-open [data-testid="lyrics-button"]::after {
   top: var(--fl-y, 64px);
   width: var(--fl-w, calc(100vw - 16px));
   height: var(--fl-h, calc(100vh - 152px));
-  z-index: 90;
+  z-index: 6; /* inside #main: above pages/sidebars (≤4), below Spotify's popovers (search dropdown = 7) */
   border-radius: 8px;
   overflow: hidden;
   contain: strict;

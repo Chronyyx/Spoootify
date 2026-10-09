@@ -175,12 +175,14 @@
           <button class="fl-btn" data-act="off-" aria-label="Lyrics earlier">−</button><output></output>
           <button class="fl-btn" data-act="off+" aria-label="Lyrics later">+</button></div></div>
         <div class="fl-row"><label for="fl-tog-blur">Depth blur</label><input id="fl-tog-blur" class="fl-tog" type="checkbox" data-set="blur"></div>
-        <div class="fl-row"><label for="fl-tog-lrc">Word-synced lyrics from LRCLIB</label><input id="fl-tog-lrc" class="fl-tog" type="checkbox" data-set="lrclib"></div>
+        <div class="fl-row"><label for="fl-tog-lrc">Extra lyrics sources (LRCLIB, NetEase, lyrics.ovh)</label><input id="fl-tog-lrc" class="fl-tog" type="checkbox" data-set="lrclib"></div>
         <div class="fl-row"><label for="fl-tog-hj">Spotify's lyrics button opens Fluid Lyrics<small style="display:block;color:rgba(255,255,255,.5);margin-top:2px">Off: use the ✦ button next to it</small></label><input id="fl-tog-hj" class="fl-tog" type="checkbox" data-set="hijack"></div>
         <div class="fl-src"></div>
       </div>`;
     shadow.appendChild(root);
-    document.body.appendChild(host);
+    // inside #main's stacking context, at a z-index between Spotify's pages (≤4) and its popover
+    // layers (search dropdown, menus: 5/7) — so those still open on top of the viewer
+    (document.getElementById('main') || document.body).appendChild(host);
     bgCanvas = root.querySelector('#fl-bg');
     linesEl = root.querySelector('.fl-lines');
     scrollerEl = root.querySelector('.fl-scroller');
@@ -295,7 +297,7 @@
     root.classList.toggle('is-static', data.kind === 'static');
     if (data.kind === 'none') {
       linesEl.innerHTML = '';
-      showMsg(data.reason === 'instrumental' ? 'Instrumental' : 'No lyrics for this song', data.reason === 'instrumental' ? '' : 'Spotify and LRCLIB had nothing synced for it.');
+      showMsg(data.reason === 'instrumental' ? 'Instrumental' : 'No lyrics for this song', data.reason === 'instrumental' ? '' : 'Spotify, LRCLIB, NetEase and lyrics.ovh have nothing for it yet.');
       return;
     }
     showMsg('');
@@ -815,6 +817,7 @@
     if (settings.hijack) {
       if (ownBtn) ownBtn.remove();
       ownBtn = null;
+      unlockNative();
       return;
     }
     if (ownBtn && ownBtn.isConnected) return;
@@ -828,6 +831,15 @@
     ownBtn.innerHTML = '<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 0l1.6 4.4L14 6 9.6 7.6 8 12 6.4 7.6 2 6l4.4-1.6zM13 10l.8 2.2L16 13l-2.2.8L13 16l-.8-2.2L10 13l2.2-.8z"/></svg>';
     ownBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); toggle(); });
     native.insertAdjacentElement('beforebegin', ownBtn);
+  }
+
+  // Spotify disables its lyrics button on songs it has no lyrics for, and a disabled button
+  // never dispatches the click we hijack — but we may still find lyrics elsewhere (LRCLIB…)
+  function unlockNative() {
+    const native = document.querySelector('[data-testid="lyrics-button"]');
+    if (!native || !native.disabled) return;
+    native.disabled = false;
+    native.setAttribute('aria-label', 'Lyrics');
   }
 
   // ═════════════════════════ interaction ═════════════════════════
@@ -964,8 +976,20 @@
     } catch {}
     const bar = document.querySelector('[data-testid="now-playing-bar"]');
     if (bar) new ResizeObserver(() => isOpen && layoutShell()).observe(bar);
-    // React may re-render the player bar; re-add our button if it gets dropped (rare, cheap check)
-    if (bar) new MutationObserver(() => { if (!settings.hijack && !(ownBtn && ownBtn.isConnected)) ensureOwnButton(); }).observe(bar, { childList: true, subtree: true });
+    // navigating to another page (e.g. full search results) closes the viewer, as Spotify's own
+    // lyrics view does — pages render underneath us. The search dropdown itself floats above.
+    try {
+      const hist = sp.platform.getHistory();
+      let path = hist.location.pathname;
+      hist.listen((loc) => {
+        if (loc.pathname !== path && isOpen) close();
+        path = loc.pathname;
+      });
+    } catch {}
+    // React re-mounts the player bar after boot (an observer on it goes stale), so poll instead:
+    // re-add our button if it got dropped, and re-enable Spotify's lyrics button whenever it
+    // disables it for a song. One querySelector a second — negligible.
+    setInterval(ensureOwnButton, 1000);
     ensureOwnButton();
     document.fonts && document.fonts.ready.then(() => { if (view.items.length) { measure(); place(true); } });
     onPlayerUpdate();

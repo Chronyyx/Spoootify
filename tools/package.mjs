@@ -10,7 +10,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FILES = [
   'install.bat', 'uninstall.bat', 'README.txt', 'BLUEPRINT.md', 'version.json',
   'src/fluid-lyrics.js', 'src/fluid-lyrics.css', 'src/fl-engine.worker.js', 'src/fl-bg.worker.js',
-  'tools/inject.mjs', 'tools/zip.mjs', 'tools/watch.mjs', 'tools/setup.mjs', 'tools/update.mjs', 'tools/config.mjs',
+  'tools/inject.mjs', 'tools/zip.mjs', 'tools/watch.mjs', 'tools/setup.mjs', 'tools/update.mjs', 'tools/config.mjs', 'tools/lyrics-proxy.mjs',
 ];
 const entries = FILES.map((f) => {
   const p = path.join(ROOT, f);
