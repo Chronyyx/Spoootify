@@ -137,7 +137,7 @@ async function updateCycle(reason) {
 }
 
 log(`helper started (pid ${process.pid}, version ${localVersion(DIR)})`);
-startLyricsProxy(log);
+startLyricsProxy(log, DIR);
 setTimeout(() => updateCycle('boot'), 20000); // give the network a moment after logon
 setInterval(() => updateCycle('periodic'), UPDATE_EVERY_MS);
 watchApps();

@@ -9,3 +9,4 @@ watch.pid
 .previous/
 node_modules/
 yo.txt
+mxm-token.json

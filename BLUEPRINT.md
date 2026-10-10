@@ -27,7 +27,8 @@ Spotify 1.3.x keeps almost all of its JS in a V8 startup snapshot. There's no re
 
 Data comes from:
 - lyrics: `spclient …/color-lyrics/v2` (line-synced)
-- true word timing, when it exists: LRCLIB (enhanced LRC or `lyricsfile` word entries), NetEase `yrc`
+- true word timing, when it exists, first: Musixmatch `richsync` (word offsets per line, human-synced; the same catalogue Spotify's line lyrics come from). Fetched by the helper's relay through Musixmatch's iOS-app endpoint with an anonymous token cached in `mxm-token.json`, the route the open-source lyrics-plus custom app uses. The web/desktop endpoints hand out a dummy token that returns scrambled decoy lyrics. A repeated whole-`(…)` background line squeezed to under 60 % of its first take reuses that take's timing.
+- other word timing: LRCLIB (enhanced LRC or `lyricsfile` word entries), NetEase `yrc`
 - fallbacks, in order, when Spotify has no timed lyrics:
   1. LRCLIB exact lookup, then LRCLIB search ranked by name, artist, sync and duration (±4 s)
   2. NetEase Cloud Music (line `lrc` or word `yrc`, credit lines dropped). NetEase sends no CORS headers, so the background helper relays it from `127.0.0.1:47321` (`tools/lyrics-proxy.mjs`): one fixed route, and it answers only the `xpui.app.spotify.com` origin

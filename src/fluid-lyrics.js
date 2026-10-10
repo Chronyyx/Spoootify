@@ -175,7 +175,7 @@
           <button class="fl-btn" data-act="off-" aria-label="Lyrics earlier">−</button><output></output>
           <button class="fl-btn" data-act="off+" aria-label="Lyrics later">+</button></div></div>
         <div class="fl-row"><label for="fl-tog-blur">Depth blur</label><input id="fl-tog-blur" class="fl-tog" type="checkbox" data-set="blur"></div>
-        <div class="fl-row"><label for="fl-tog-lrc">Extra lyrics sources (LRCLIB, NetEase, lyrics.ovh)</label><input id="fl-tog-lrc" class="fl-tog" type="checkbox" data-set="lrclib"></div>
+        <div class="fl-row"><label for="fl-tog-lrc">Extra lyrics sources (Musixmatch word timing, LRCLIB, NetEase, lyrics.ovh)</label><input id="fl-tog-lrc" class="fl-tog" type="checkbox" data-set="lrclib"></div>
         <div class="fl-row"><label for="fl-tog-hj">Spotify's lyrics button opens Fluid Lyrics<small style="display:block;color:rgba(255,255,255,.5);margin-top:2px">Off: use the ✦ button next to it</small></label><input id="fl-tog-hj" class="fl-tog" type="checkbox" data-set="hijack"></div>
         <div class="fl-src"></div>
       </div>`;
@@ -297,7 +297,7 @@
     root.classList.toggle('is-static', data.kind === 'static');
     if (data.kind === 'none') {
       linesEl.innerHTML = '';
-      showMsg(data.reason === 'instrumental' ? 'Instrumental' : 'No lyrics for this song', data.reason === 'instrumental' ? '' : 'Spotify, LRCLIB, NetEase and lyrics.ovh have nothing for it yet.');
+      showMsg(data.reason === 'instrumental' ? 'Instrumental' : 'No lyrics for this song', data.reason === 'instrumental' ? '' : 'Spotify, Musixmatch, LRCLIB, NetEase and lyrics.ovh have nothing for it yet.');
       return;
     }
     showMsg('');
@@ -591,7 +591,10 @@
 
   function teardown() {
     clearTimeout(view.timer);
-    for (const rec of view.items) if (rec.anims) kill(rec);
+    for (const rec of view.items) {
+      if (rec.anims) kill(rec);
+      if (rec.el) rec.el.classList.remove('is-active', 'is-parallel'); // else a stale highlight survives a reopen
+    }
     view.armed.clear();
     view.active = -1;
   }
@@ -623,6 +626,13 @@
 
     const want = new Set();
     if (active >= 0) want.add(active);
+    // parallel voices: an earlier line still being sung under the current one stays lit & filling
+    const parallel = [];
+    for (let i = idx - 1; i >= Math.max(0, idx - 3); i--) {
+      if (items[i].ov && t < items[i].vEnd + 200) { want.add(i); parallel.push(i); }
+    }
+    for (const rec of items) if (rec.el && rec.el.classList.contains('is-parallel') && !parallel.includes(rec.i)) rec.el.classList.remove('is-parallel');
+    for (const i of parallel) items[i].el.classList.add('is-parallel');
     // No pre-arming of the next line: every live animation is restyled on each main-thread frame
     // (hover, clicks), so fewer is cheaper. Arming at the boundary is still frame-exact because
     // startTimes are absolute — a late timer just starts the animation already in progress.
@@ -637,6 +647,7 @@
     let next = Infinity;
     if (active >= 0) next = items[active].e;
     if (idx + 1 < items.length) next = Math.min(next, items[idx + 1].s);
+    for (const i of parallel) next = Math.min(next, items[i].vEnd + 200);
     if (next === Infinity) return;
     const delay = Math.max(4, (next - t) / clock.speed);
     view.timer = setTimeout(() => sync(false), delay);

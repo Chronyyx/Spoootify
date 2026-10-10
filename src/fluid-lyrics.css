@@ -203,7 +203,8 @@ html.fl-open [data-testid="lyrics-button"]::after {
   cursor: pointer;
   contain: layout style;
 }
-.fl-line.is-active { opacity: 1; filter: none; }
+/* is-parallel: a background voice still singing under the current line stays as lit as it */
+.fl-line.is-active, .fl-line.is-parallel { opacity: 1; filter: none; }
 .fl-line:hover { background: rgba(255, 255, 255, .05); }
 #fl-root.no-blur .fl-line { filter: none; }
 /* while the user scrolls by hand: no blur, no stagger, quick follow */

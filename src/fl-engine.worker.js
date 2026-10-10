@@ -103,6 +103,19 @@ function lrclib(track) {
   });
 }
 
+// Musixmatch per-word timing ("richsync") through the helper's relay — the same source Spotify's
+// own line lyrics come from, so it covers most of what Spotify has, with real word times.
+function musixmatch(track) {
+  if (track.isLocal) return Promise.resolve(null);
+  return getJSON('http://127.0.0.1:47321/v1/musixmatch?' + new URLSearchParams({
+    track: track.name,
+    artist: track.artists[0] || '',
+    album: track.album || '',
+    duration: String(Math.round(track.durationMs / 1000)),
+    id: track.id || '',
+  }), {}, 12000);
+}
+
 // NetEase Cloud Music sends no CORS headers, so it is queried through the Spoootify helper's
 // local relay (tools/lyrics-proxy.mjs). No helper running → connection refused → null, fast.
 function netease(track) {
@@ -157,18 +170,166 @@ async function audioAnalysis(track, token) {
     T[i] = times[idx[i]];
     S[i] = strength[idx[i]];
   }
-  return { t: T, s: S };
+  // per-segment loudness, for finding where a line's vocal really stops (vocalEnd)
+  const LT = new Float64Array(segs.length), LL = new Float32Array(segs.length), LA = new Float32Array(segs.length);
+  segs.forEach((s, i) => { LT[i] = s.start * 1000; LL[i] = s.loudness_max; LA[i] = s.loudness_max - s.loudness_start; });
+  const beats = Array.isArray(j.beats) && j.beats.length > 8 ? Float64Array.from(j.beats, (b) => b.start * 1000) : null;
+  return { t: T, s: S, lt: LT, ll: LL, la: LA, beats };
+}
+
+/**
+ * Where does the vocal of a line end inside its slot? Line-synced lyrics only give starts, so a
+ * fast rap line followed by two beats of instrumental gets the whole slot and the fill drags.
+ * The vocal level is the line's 75th-percentile segment loudness; the vocal has ended at the
+ * earliest quiet segment after which the rest of the slot (≥ 700 ms) stays quiet — at most 20 %
+ * loud segments (stray beat hits) and a median ≥ 6 dB under the vocal level. The sung part must
+ * also be long enough to hold the words. Conservative — returns 0 (no opinion) unless clear.
+ */
+function vocalEnd(onsets, start, slotEnd, natural) {
+  if (!onsets || !onsets.lt) return 0;
+  const { lt: T, ll: L } = onsets;
+  const lo = lowerBound(T, start), hi = lowerBound(T, slotEnd);
+  if (hi - lo < 6) return 0;
+  const sorted = (a) => [...a].sort((x, y) => x - y);
+  const all = sorted(L.subarray(lo, hi));
+  const ref = all[Math.floor((all.length - 1) * 0.75)];
+  const loud = (i) => L[i] >= ref - 4;
+  const minHead = Math.max(800, natural * 0.45);
+  for (let c = lo + 3; c < hi; c++) {
+    if (T[c] - start < minHead || loud(c)) continue;
+    if (slotEnd - T[c] < 700) break;
+    let nLoud = 0;
+    const quiet = [];
+    for (let i = c; i < hi; i++) loud(i) ? nLoud++ : quiet.push(L[i]);
+    // one stray beat hit is always tolerated (a short tail of 4 segments is otherwise 25 % "loud"),
+    // and those hits are left out when judging how quiet the rest is
+    const q = sorted(quiet);
+    if (nLoud <= Math.max(1, (hi - c) * 0.2) && q[q.length >> 1] <= ref - 6) return T[c] + 60;
+  }
+  return 0;
+}
+
+/**
+ * A line rapped fast and closed by one long held word ("…word to my deeeads"): the last sharp,
+ * loud attack in the slot is followed by ≥ 700 ms of sustained sound with no new attack. Returns
+ * that attack's time (= the held word's onset) or 0. A quiet tail is vocalEnd's case, not this.
+ */
+function heldOnset(onsets, start, slotEnd, nWords) {
+  if (!onsets || !onsets.la || nWords < 3) return 0;
+  const { lt: T, ll: L, la: A } = onsets;
+  const lo = lowerBound(T, start), hi = lowerBound(T, slotEnd);
+  if (hi - lo < 6) return 0;
+  const all = [...L.subarray(lo, hi)].sort((x, y) => x - y);
+  const ref = all[Math.floor((all.length - 1) * 0.75)];
+  const strong = (i) => A[i] >= 9 && L[i] >= ref - 4;
+  let last = -1;
+  for (let i = hi - 1; i >= lo; i--) if (strong(i)) { last = i; break; }
+  if (last < lo + 3 || slotEnd - T[last] < 700) return 0;
+  // the words before it must be clearly articulated (≥ 1 attack per 2 words) — in legato
+  // singing the "last attack" says little about where the last word is
+  let attacks = 0;
+  for (let i = lo; i < last; i++) if (A[i] >= 6 && L[i] >= ref - 6) attacks++;
+  if (attacks < (nWords - 1) * 0.5) return 0;
+  // a held note is one long sound: few segment changes after the attack (≤ 2.2/s), clearly
+  // fewer than in the articulated part — lines sung on at a normal pace change 3–4×/s
+  const tailRate = (hi - last - 1) / ((slotEnd - T[last]) / 1000);
+  const preRate = (last - lo) / ((T[last] - start) / 1000);
+  if (tailRate > 2.2 || preRate < tailRate * 1.6) return 0;
+  // sustained: what follows stays near vocal level for most of its length (not a quiet tail)
+  let loudMs = 0;
+  for (let i = last; i < hi; i++) if (L[i] >= ref - 6) loudMs += (i + 1 < hi ? T[i + 1] : slotEnd) - T[i];
+  return loudMs >= (slotEnd - T[last]) * 0.6 ? T[last] : 0;
+}
+
+/**
+ * Lock a rhythmic line to the song's beat grid: rap syllables mostly land on 16th notes. Only
+ * lines whose syllable spacing is near a 16th or 8th note are touched, each syllable moves to
+ * the nearest 16th only if it is already within 40 % of a 16th of it, order and a minimum length
+ * are preserved, and the line's first syllable (a real timestamp) never moves.
+ */
+function snapToGrid(words, beats, start, end) {
+  if (!beats) return;
+  const flat = [];
+  for (const w of words) for (const y of w.syl) flat.push(y);
+  if (flat.length < 4) return;
+  let b = lowerBound(beats, start - 2000);
+  const grid = [];
+  for (; b + 1 < beats.length && beats[b] < end + 500; b++) {
+    const d = (beats[b + 1] - beats[b]) / 4;
+    for (let q = 0; q < 4; q++) grid.push(beats[b] + q * d);
+  }
+  if (grid.length < 8) return;
+  const step = (grid[grid.length - 1] - grid[0]) / (grid.length - 1);
+  const gaps = [];
+  for (let i = 1; i < flat.length; i++) gaps.push(flat[i].s - flat[i - 1].s);
+  gaps.sort((x, y) => x - y);
+  const g = gaps[gaps.length >> 1] / step;
+  if (!((g >= 0.7 && g <= 1.4) || (g >= 1.6 && g <= 2.6))) return; // not a 16th/8th-note flow
+  const ends = flat.map((y, i) => (i + 1 < flat.length && y.e >= flat[i + 1].s - 1 ? 'next' : y.e));
+  let gi = 0;
+  for (let i = 1; i < flat.length; i++) {
+    const y = flat[i];
+    while (gi + 1 < grid.length && grid[gi + 1] <= y.s) gi++;
+    const cand = Math.abs(grid[gi] - y.s) <= Math.abs((grid[gi + 1] ?? Infinity) - y.s) ? grid[gi] : grid[gi + 1];
+    if (Math.abs(cand - y.s) > step * 0.4) continue;
+    if (cand < flat[i - 1].s + MIN_SYL_MS) continue;
+    if (i + 1 < flat.length && cand > flat[i + 1].s - MIN_SYL_MS) continue;
+    y.s = cand;
+  }
+  flat.forEach((y, i) => {
+    const nextS = i + 1 < flat.length ? flat[i + 1].s : Infinity;
+    y.e = ends[i] === 'next' ? nextS : Math.min(Math.max(ends[i], y.s + 40), nextS);
+  });
+  for (const w of words) { w.s = w.syl[0].s; w.e = w.syl[w.syl.length - 1].e; }
+}
+
+/**
+ * Re-time a laid-out line so its last word starts at `onset` and holds to the end of the
+ * slot: the other words keep their relative timing, compressed into [start, onset].
+ */
+function fitHeldLast(words, start, onset, slotEnd) {
+  const lastW = words[words.length - 1];
+  const was = lastW.s;
+  if (was - onset < 300 || onset - start < 400) return; // nothing to fix / implausible
+  const k = (onset - start) / (was - start);
+  const map = (t) => start + (t - start) * k;
+  for (const w of words) {
+    if (w === lastW) continue;
+    for (const y of w.syl) { y.s = map(y.s); y.e = Math.min(map(y.e), onset); }
+    w.s = w.syl[0].s;
+    w.e = w.syl[w.syl.length - 1].e;
+  }
+  // held word: leading syllables keep their natural length, the last one carries the hold
+  const end = Math.max(onset + 400, slotEnd - 150);
+  let t = onset;
+  lastW.syl.forEach((y, i) => {
+    const len = y.e - y.s;
+    y.s = t;
+    y.e = i === lastW.syl.length - 1 ? end : Math.min(t + len, end - 100);
+    t = y.e;
+  });
+  lastW.s = onset;
+  lastW.e = end;
 }
 
 // ───────────────────────────── build ─────────────────────────────
 
 async function build(track, token, opts) {
   const wantLrc = opts.lrclib !== false;
-  const [sp, lrc, onsets] = await Promise.all([
+  const [sp, lrc, onsets, mxm] = await Promise.all([
     spotifyLyrics(track, token),
     wantLrc ? lrclib(track) : null,
     audioAnalysis(track, token),
+    wantLrc ? musixmatch(track) : null,
   ]);
+  // every source's lines pass through trimTails (audio-checked word ends) on the way out
+  const finalize = (lines, tr, source, sync) => finalizeLines(trimTails(lines, onsets), tr, source, sync);
+
+  // 0) real per-word timing from Musixmatch richsync (best source when it exists)
+  if (mxm && Array.isArray(mxm.richsync)) {
+    const lines = parseRichsync(mxm.richsync);
+    if (lines.some((l) => l.words.length)) return finalize(lines, track, 'Musixmatch', 'word');
+  }
 
   // 1) true word-level timing from LRCLIB enhanced LRC
   if (lrc && typeof lrc.syncedLyrics === 'string' && /<\d+:\d+(?:\.\d+)?>/.test(lrc.syncedLyrics)) {
@@ -261,6 +422,42 @@ function parseLRC(src) {
     for (const st of stamps) out.push({ start: st, end: 0, text });
   }
   return out.sort((a, b) => a.start - b.start);
+}
+
+// Musixmatch richsync: [{ ts, te, x, l: [{ c: "word", o: offsetSec }, { c: " ", o }, …] }, …]
+// A space token's offset is where the word before it ends; tokens with no space between them
+// are pieces of one word.
+function parseRichsync(rs) {
+  const lines = [];
+  for (const line of rs) {
+    const ts = +line.ts * 1000, te = +line.te * 1000;
+    const toks = Array.isArray(line.l) ? line.l : [];
+    const words = [];
+    let cur = null;
+    toks.forEach((tk, i) => {
+      const c = String(tk.c ?? '');
+      if (!c.trim()) { cur = null; return; }
+      const s = ts + +tk.o * 1000;
+      const e = i + 1 < toks.length ? ts + +toks[i + 1].o * 1000 : te;
+      if (!cur) { cur = { syl: [] }; words.push(cur); }
+      cur.syl.push({ text: c.trim(), s, e: Math.max(e, s + MIN_SYL_MS) });
+    });
+    if (!words.length) continue;
+    lines.push({ start: words[0].syl[0].s, text: line.x || '', words: words.map(toWord) });
+  }
+  lines.sort((a, b) => a.start - b.start);
+  // a whole "(…)" background line that repeats an earlier one but got squeezed (synced to end
+  // before the next lead line, though it's sung under it) reuses the earlier take's timing
+  const takes = new Map();
+  for (const l of lines) {
+    if (!/^\s*\(.*\)\s*$/.test(l.text)) continue;
+    const key = norm(l.text), dur = l.words[l.words.length - 1].e - l.start, prev = takes.get(key);
+    if (!prev) { takes.set(key, { l, dur }); continue; }
+    if (dur >= prev.dur * 0.6 || prev.l.words.length !== l.words.length) continue;
+    const dt = l.start - prev.l.start;
+    l.words = prev.l.words.map((w) => ({ ...w, s: w.s + dt, e: w.e + dt, syl: w.syl.map((y) => ({ ...y, s: y.s + dt, e: y.e + dt })) }));
+  }
+  return lines;
 }
 
 // NetEase prefixes lyrics with credit lines ("作词 : …", "Producer : …") — not sung, drop them
@@ -596,6 +793,39 @@ function splitAdlibs(text) {
 }
 
 function synthesize(raw, track, onsets) {
+  const isVocal0 = (t) => t && !/^[♪♫\s]*$/.test(t);
+  // audio-detected vocal ends: a line sung fast and followed by instrumental gets only the sung
+  // part as its slot (an exact lyricsfile end, when present, is better and wins)
+  if (onsets) {
+    for (let k = 0; k < raw.length; k++) {
+      const r = raw[k], next = raw[k + 1];
+      if (r.endExact || !isVocal0(r.text)) continue;
+      const slotEnd = r.end > r.start ? r.end : next ? next.start : Math.min(track.durationMs, r.start + 6000);
+      const e = vocalEnd(onsets, r.start, slotEnd, prosody(r.text).units * UNIT_MS);
+      if (e) { r.end = e; r.endExact = true; }
+    }
+  }
+  // local pace: a verse keeps a fairly steady flow, so lines with a known vocal end (lyricsfile or
+  // audio) tell us how fast this stretch is delivered. A neighbouring line whose slot would make it
+  // ≥ 1.25× slower than that (rap line + beat with no clear silence) is sung at the local pace
+  // instead of being stretched across the beat. No known neighbours (sung parts) → unchanged.
+  const units = raw.map((r) => (isVocal0(r.text) ? prosody(splitAdlibs(r.text).main.join(' ') || r.text).units : 0));
+  const pace = raw.map((r, k) => (r.endExact && units[k] >= 6 ? (r.end - r.start) / units[k] : 0));
+  for (let k = 0; k < raw.length; k++) {
+    const r = raw[k], next = raw[k + 1];
+    if (r.endExact || units[k] < 6) continue;
+    const near = [];
+    for (let j = Math.max(0, k - 6); j <= Math.min(raw.length - 1, k + 6); j++) if (pace[j]) near.push(pace[j]);
+    if (near.length < 3) continue;
+    near.sort((x, y) => x - y);
+    const local = near[near.length >> 1];
+    const slotEnd = next ? next.start : Math.min(track.durationMs, r.start + 6000);
+    if ((slotEnd - r.start) * 0.97 / units[k] < local * 1.25) continue;
+    // a fast line closed by a long held word really does use its slot (heldOnset handles it)
+    if (heldOnset(onsets, r.start, slotEnd, r.text.split(/\s+/).length)) continue;
+    r.end = Math.min(slotEnd - 100, r.start + units[k] * local * 1.1);
+    r.endExact = true;
+  }
   const slotOf = (k) => {
     const r = raw[k], next = raw[k + 1];
     return Math.max(250, (r.end > r.start ? r.end : next ? next.start : Math.min(track.durationMs, r.start + 6000)) - r.start);
@@ -615,6 +845,7 @@ function synthesize(raw, track, onsets) {
   const stretch = Math.min(STRETCH_MAX, Math.max(STRETCH_MIN, songRate * SONG_K));
 
   const lines = [];
+  const bgTakes = new Map(); // background-vocal line text → its first full take's timing
   for (let k = 0; k < raw.length; k++) {
     const r = raw[k];
     const text = r.text;
@@ -628,6 +859,27 @@ function synthesize(raw, track, onsets) {
     const parallel = split.main.length > 0 && split.groups.length > 0;
     const lead = parallel ? split.main.join(' ') : text;
 
+    // ── a whole background-vocal line "(…)" is another voice: it may keep going under the next
+    // lead line, so it isn't squeezed into its slot. A repeat reuses the earlier take's timing.
+    if (!split.main.length && split.groups.length) {
+      const key = norm(text);
+      const prev = bgTakes.get(key);
+      const natural = prosody(text).units * UNIT_MS;
+      let words = null;
+      if (prev && slot < prev.dur * 0.85) {
+        const dt = r.start - prev.start;
+        words = prev.words.map((w) => ({ ...w, s: w.s + dt, e: w.e + dt, syl: w.syl.map((y) => ({ ...y, s: y.s + dt, e: y.e + dt })) }));
+      } else if (slot < natural * 0.8) {
+        words = layOut(text, r.start, natural, 0).words;
+        if (onsets) snapToGrid(words, onsets.beats, r.start, r.start + natural);
+        applyLead(words, r.start);
+      }
+      if (words) {
+        lines.push({ start: r.start, text, words });
+        continue;
+      }
+    }
+
     // ── lead vocal: owns the whole slot ──
     // Pacing constants are fitted to human word annotations (JamendoLyrics: tuned on 39 songs,
     // validated on 39 others). Vocals use ~97 % of a line's slot; a line may stretch the nominal
@@ -637,10 +889,16 @@ function synthesize(raw, track, onsets) {
     const base = r.endExact ? budget : Math.min(budget, Math.max(natural, Math.min(budget * 0.92, natural * stretch)));
     const hold = Math.min(Math.max(0, budget - base) * 0.15, 800);
     const main = layOut(lead, r.start, base, hold);
-    if (onsets) alignToAudio(main.words, onsets, r.start, Math.min(slotEnd, main.end + 400));
+    const held = onsets ? heldOnset(onsets, r.start, slotEnd, main.words.length) : 0;
+    if (held) fitHeldLast(main.words, r.start, held, slotEnd);
+    else if (onsets) alignToAudio(main.words, onsets, r.start, Math.min(slotEnd, main.end + 400));
+    if (onsets) snapToGrid(main.words, onsets.beats, r.start, slotEnd);
     applyLead(main.words, r.start);
     if (!parallel) {
       lines.push({ start: r.start, text, words: main.words });
+      if (!split.main.length && split.groups.length) {
+        bgTakes.set(norm(text), { start: r.start, words: main.words, dur: main.words[main.words.length - 1].e - r.start });
+      }
       continue;
     }
 
@@ -678,13 +936,17 @@ function synthesize(raw, track, onsets) {
 // Synthesized timing is never exact; a late fill reads as lag while a slightly early one reads
 // as "leading the voice" (Apple's feel). Fitted on JamendoLyrics with lateness penalised 2x:
 // 120 ms cuts words >300 ms late from 16.8 % to 12.0 % (held-out songs).
-const LEAD_MS = 120;
+// The line start itself is a real timestamp and stays put, so the lead eases in over the first
+// LEAD_RAMP_MS: a flat shift squeezed the first word to ~40 ms on 15 % of lines (the second word
+// lit almost instantly — "rushed" cadence). Ramped: 0 % squeezed, 2nd-word median error 107→78 ms.
+const LEAD_MS = 120, LEAD_RAMP_MS = 800;
 function applyLead(words, lineStart) {
   const first = words[0].syl[0];
+  const lead = (t) => LEAD_MS * Math.min(1, (t - lineStart) / LEAD_RAMP_MS);
   for (const w of words) {
     for (const y of w.syl) {
-      if (y !== first) y.s = Math.max(lineStart + 40, y.s - LEAD_MS);
-      y.e = Math.max(y.s + 40, y.e - LEAD_MS);
+      if (y !== first) y.s = Math.max(lineStart + 40, y.s - lead(y.s));
+      y.e = Math.max(y.s + 40, y.e - lead(y.e));
     }
     w.s = w.syl[0].s;
     w.e = w.syl[w.syl.length - 1].e;
@@ -775,7 +1037,56 @@ function lowerBound(arr, x, lo = 0, hi = arr.length) {
  *  { t:'line', s, e (active-until), vEnd (vocal end), bgFrom, words:[{text,s,e,syl:[{s,e,c}],emph,bg}] }
  *  { t:'gap', s, e }  ← instrumental break shown as Apple-style breathing dots
  */
-function finalize(lines, track, source, sync) {
+/**
+ * A line's last word is often stretched to the line's end (Musixmatch line end, a synthesized
+ * hold), which drags its fill and lights the held-word glow long after the voice stopped. With
+ * audio: end a long last word at the first lasting drop ≥ 6 dB below its own onset level, never
+ * shorter than a natural length for its syllables; a word already far quieter than the rest of
+ * the line (sung into silence) just gets that natural length. Real holds stay loud → untouched.
+ */
+function trimTails(lines, onsets) {
+  if (!onsets || !onsets.lt) return lines;
+  const { lt: T, ll: L } = onsets;
+  for (const l of lines) {
+    if (!l.words || !l.words.length) continue;
+    const w = l.words[l.words.length - 1];
+    if (w.e - w.s < 900) continue;
+    const natural = 200 + 170 * w.syl.length;
+    const a = lowerBound(T, w.s - 150), b = lowerBound(T, w.e);
+    if (b - a < 2) continue;
+    let ref = -Infinity;
+    for (let i = a; i < b && T[i] <= w.s + 350; i++) ref = Math.max(ref, L[i]);
+    // the line's vocal level, for words that start in near-silence
+    const la = lowerBound(T, l.start), lb = lowerBound(T, w.s);
+    const lineL = [...L.subarray(la, lb)].sort((x, y) => x - y);
+    const lineRef = lineL.length >= 3 ? lineL[Math.floor((lineL.length - 1) * 0.75)] : ref;
+    let end = w.e;
+    if (ref < lineRef - 8) end = w.s + natural;
+    else {
+      for (let i = a; i < b; i++) {
+        if (T[i] < w.s + 200) continue;
+        const next = i + 1 < b ? L[i + 1] : -Infinity;
+        if (L[i] <= ref - 6 && next <= ref - 4) { end = T[i] + 60; break; }
+      }
+    }
+    // no drop, but the sound keeps changing (> 2.6 segments/s): that's the backing track moving on
+    // under a loud mix, not one sustained note (a real hold changes ≤ ~2×/s) → natural length
+    if (end === w.e && w.e - w.s > 1200) {
+      let n = 0;
+      for (let i = a; i < b; i++) if (T[i] > w.s + 150) n++;
+      if (n / ((w.e - w.s) / 1000) > 2.6) end = w.s + Math.max(natural * 1.5, 600);
+    }
+    end = Math.min(w.e, Math.max(end, w.s + natural));
+    if (end >= w.e - 50) continue;
+    // shrink the word's syllables proportionally into its new length
+    const k = (end - w.s) / (w.e - w.s);
+    for (const y of w.syl) { y.s = w.s + (y.s - w.s) * k; y.e = w.s + (y.e - w.s) * k; }
+    w.e = end;
+  }
+  return lines;
+}
+
+function finalizeLines(lines, track, source, sync) {
   const items = [];
   const dur = track.durationMs || 0;
   const vocal = lines.filter((l) => l.words && l.words.length);
@@ -813,7 +1124,12 @@ function finalize(lines, track, source, sync) {
     const gap = nextStart - vEnd;
     const allBg = words.every((w) => w.bg);
     if (allBg) words.forEach((w) => (w.bg = 0));
-    items.push({ t: 'line', s: round(words[0].s), e: round(gap >= GAP_MIN_MS ? vEnd + 350 : nextStart), vEnd: round(vEnd), words, side: allBg ? 'bg' : '' });
+    items.push({
+      t: 'line', s: round(words[0].s), e: round(gap >= GAP_MIN_MS ? vEnd + 350 : nextStart), vEnd: round(vEnd), words,
+      side: allBg ? 'bg' : '',
+      // still being sung when the next line starts (a parallel voice): the renderer keeps it lit
+      ov: vEnd > nextStart + 150 ? 1 : 0,
+    });
     if (gap >= GAP_MIN_MS && nx) items.push({ t: 'gap', s: round(vEnd + 450), e: round(nextStart - 220) });
   }
   return { kind: 'synced', source, sync, items };
