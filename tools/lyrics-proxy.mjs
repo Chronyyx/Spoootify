@@ -178,8 +178,15 @@ export function startLyricsProxy(log = () => {}, dataDir = null) {
     res.writeHead(out ? 200 : 404, head);
     res.end(JSON.stringify(out || {}));
   });
-  server.on('error', (e) => log(`lyrics relay not started: ${e.code || e.message}`));
-  server.listen(PORT, '127.0.0.1', () => log(`lyrics relay on 127.0.0.1:${PORT}`));
+  // after a self-update the new helper starts a moment before the old one exits and frees the
+  // port — keep retrying for a while instead of giving up on the first EADDRINUSE
+  let tries = 0;
+  server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE' && ++tries <= 20) { setTimeout(() => server.listen(PORT, '127.0.0.1'), 3000); return; }
+    log(`lyrics relay not started: ${e.code || e.message}`);
+  });
+  server.on('listening', () => log(`lyrics relay on 127.0.0.1:${PORT}${tries ? ` (after ${tries} retr${tries > 1 ? 'ies' : 'y'})` : ''}`));
+  server.listen(PORT, '127.0.0.1');
   return server;
 }
 
