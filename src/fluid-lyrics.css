@@ -292,6 +292,17 @@ html.fl-open [data-testid="lyrics-button"]::after {
   transition: opacity .18s ease, transform .45s var(--fl-spring), visibility 0s, background-color .15s ease;
 }
 
+/* "Lyrics by …" after the last line; moves with the lines (same --fl-y) */
+.fl-credit {
+  margin-top: 1.6em;
+  font-size: 15px; font-weight: 700; letter-spacing: 0; line-height: 1.4;
+  color: rgba(255, 255, 255, .55);
+  transform: translateY(var(--fl-y));
+  transition: transform var(--fl-scroll-ms) var(--fl-spring);
+  pointer-events: none;
+}
+.fl-credit small { display: block; font-size: 13px; font-weight: 600; color: rgba(255, 255, 255, .38); }
+
 /* static (unsynced) lyrics: native scrolling */
 #fl-root.is-static .fl-scroller { overflow-y: auto; scrollbar-width: none; }
 #fl-root.is-static .fl-lines { position: relative; padding-top: 6cqh; }

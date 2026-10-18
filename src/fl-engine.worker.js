@@ -328,6 +328,22 @@ async function build(track, token, opts) {
   // 0) real per-word timing from Musixmatch richsync (best source when it exists)
   if (mxm && Array.isArray(mxm.richsync)) {
     const lines = parseRichsync(mxm.richsync);
+    if (lrc && typeof lrc.syncedLyrics === 'string') alignToLines(lines, parseLRC(lrc.syncedLyrics));
+    // lines whose words were tapped through (≥ 3 in a row starting < 90 ms apart — 15 words/s,
+    // faster than anyone sings) get estimated word timing inside Musixmatch's own line span
+    const tapped = lines.map((l) => {
+      let run = 0;
+      for (let k = 1; k < l.words.length; k++) {
+        run = l.words[k].s - l.words[k - 1].s < 90 ? run + 1 : 0;
+        if (run >= 3) return true;
+      }
+      return false;
+    });
+    if (tapped.some(Boolean)) {
+      const raw = lines.map((l) => ({ start: l.start, end: l.words.length ? l.words.at(-1).e : 0, endExact: true, text: l.text }));
+      const est = synthesize(raw, track, onsets);
+      lines.forEach((l, i) => { if (tapped[i] && est[i] && est[i].words.length) l.words = est[i].words; });
+    }
     if (lines.some((l) => l.words.length)) return finalize(lines, track, 'Musixmatch', 'word');
   }
 
@@ -407,6 +423,62 @@ async function build(track, token, opts) {
 const TS = /\[(\d+):(\d+(?:\.\d+)?)\]/g;
 const ts2ms = (m, s) => (+m * 60 + +s) * 1000;
 
+/**
+ * Musixmatch richsync can run late as a whole (Blame Game: 0.4–1.5 s behind LRCLIB and NetEase,
+ * which agree with each other to ~0.02 s). Line-synced stamps sit a little ahead of the voice
+ * (~0.35 s), so only the excess is corrected: per line, Musixmatch − LRCLIB, smoothed over its
+ * neighbours (one bad LRCLIB stamp can't drag a line), shifts the whole line earlier — the word
+ * spacing inside stays Musixmatch's. Songs where the two agree (I'm In It, ~+0.4 s) are untouched.
+ */
+const LINE_STAMP_LEAD_MS = 350;
+function alignToLines(lines, ref) {
+  const key = (t) => norm(t.replace(/<[^>]*>/g, '')).slice(0, 24);
+  const pool = ref.filter((r) => r.text).map((r) => ({ t: r.start, k: key(r.text), used: false }));
+  const d = lines.map((l) => {
+    const k = key(l.text || '');
+    if (!k) return NaN;
+    let best = null;
+    for (const r of pool) if (!r.used && r.k === k && Math.abs(r.t - l.start) < 6000 && (!best || Math.abs(r.t - l.start) < Math.abs(best.t - l.start))) best = r;
+    if (!best) return NaN;
+    best.used = true;
+    return l.start - best.t;
+  });
+  const known = d.filter((x) => !Number.isNaN(x));
+  if (known.length < 8 || known.length < lines.length * 0.6) return; // not the same lyrics/version
+  const moved = new Set();
+  for (let i = 0; i < lines.length; i++) {
+    const win = [];
+    for (let j = Math.max(0, i - 2); j <= Math.min(lines.length - 1, i + 2); j++) if (!Number.isNaN(d[j])) win.push(d[j]);
+    if (win.length < 3) continue;
+    win.sort((a, b) => a - b);
+    const med = win[win.length >> 1];
+    const own = Number.isNaN(d[i]) || Math.abs(d[i] - med) > 500 ? med : d[i];
+    const shift = own - LINE_STAMP_LEAD_MS;
+    if (shift < 150) continue;
+    const l = lines[i];
+    for (const w of l.words) {
+      for (const y of w.syl) { y.s -= shift; y.e -= shift; }
+      w.s -= shift;
+      w.e -= shift;
+    }
+    l.start -= shift;
+    moved.add(l);
+  }
+  lines.sort((a, b) => a.start - b.start);
+  // a line moved further than the one before it now starts under that line's tail, which would
+  // read as two voices at once and keep the old line lit ("sticky"): end the tail before it
+  for (let i = 0; i + 1 < lines.length; i++) {
+    const l = lines[i], nx = lines[i + 1];
+    if (!moved.has(nx) || !l.words.length || /^\s*\(.*\)\s*$/.test(l.text || '')) continue;
+    const limit = nx.start - 60, w = l.words[l.words.length - 1];
+    if (w.e <= limit) continue;
+    const s = Math.min(w.s, limit - 120), k = (limit - s) / Math.max(1, w.e - w.s);
+    for (const y of w.syl) { y.s = s + (y.s - w.s) * k; y.e = s + (y.e - w.s) * k; }
+    w.s = s;
+    w.e = limit;
+  }
+}
+
 function parseLRC(src) {
   const out = [];
   for (const row of src.split(/\r?\n/)) {
@@ -427,6 +499,8 @@ function parseLRC(src) {
 // Musixmatch richsync: [{ ts, te, x, l: [{ c: "word", o: offsetSec }, { c: " ", o }, …] }, …]
 // A space token's offset is where the word before it ends; tokens with no space between them
 // are pieces of one word.
+const INTERJ = /^(?:u+h+|o+h+|o+|a+h+|ye+a+h*|whoa+|woah+|hey+|m+h*m+|na+|la+)\W*$/i;
+
 function parseRichsync(rs) {
   const lines = [];
   for (const line of rs) {
@@ -443,6 +517,39 @@ function parseRichsync(rs) {
       cur.syl.push({ text: c.trim(), s, e: Math.max(e, s + MIN_SYL_MS) });
     });
     if (!words.length) continue;
+    // a first word far longer than the rest of its line is usually the line stamp set early, not a
+    // held note ("I'm" 77.46→79.22 s, then six words in 1.1 s): start it a natural length before
+    // the second word. Interjections ("Uh") and slow "(…)" croons can really be held → left alone.
+    const first = words[0];
+    if (words.length >= 3 && first.syl.length === 1 && !/^\s*\(/.test(line.x || '') && !INTERJ.test(first.syl[0].text)) {
+      const d = words.slice(1).map((w) => w.syl[w.syl.length - 1].e - w.syl[0].s).sort((a, b) => a - b);
+      const med = d[d.length >> 1];
+      const y = first.syl[0], to = words[1].syl[0].s;
+      if (to - y.s > Math.max(900, 4 * med)) y.s = Math.max(y.s, to - Math.max(370, 1.5 * med));
+    }
+    // same fault mid-line: one word held far longer than the rest, then the words after it
+    // crammed in at the end ("and" 92.09→93.91 s, then "found somebody else" in 0.5 s). The
+    // crammed words were sung right after it: relay them at a natural pace from there, and let
+    // the line's last word keep the leftover time (it's the one that rings out)
+    for (let k = 1; k + 2 < words.length; k++) {
+      const wk = words[k], after = words.slice(k + 1);
+      const ws = wk.syl[0].s, next = after[0].syl[0].s, end = after[after.length - 1].syl.at(-1).e;
+      const others = words.filter((_, i) => i !== k).map((w) => w.syl.at(-1).e - w.syl[0].s).sort((a, b) => a - b);
+      const med = others[others.length >> 1];
+      if (next - ws <= Math.max(900, 4 * med) || (end - next) / after.length >= 200) continue;
+      const fit = (w, s, e) => {
+        const s0 = w.syl[0].s, e0 = w.syl.at(-1).e, kk = (e - s) / Math.max(1, e0 - s0);
+        for (const y of w.syl) { y.s = s + (y.s - s0) * kk; y.e = s + (y.e - s0) * kk; }
+      };
+      let t = ws + Math.max(370, 1.5 * med);
+      fit(wk, ws, t - 40);
+      after.forEach((w, i) => {
+        const len = i === after.length - 1 ? Math.max(end - t, 300) : 120 + 110 * w.syl.length;
+        fit(w, t, t + len - 30);
+        t += len;
+      });
+      break;
+    }
     lines.push({ start: words[0].syl[0].s, text: line.x || '', words: words.map(toWord) });
   }
   lines.sort((a, b) => a.start - b.start);

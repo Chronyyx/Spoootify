@@ -18,7 +18,10 @@
     ? new URL('.', document.currentScript.src).href
     : '/fluid-lyrics/';
   const LS_KEY = 'fluid-lyrics:v1';
-  const settings = Object.assign({ offset: 0, blur: true, lrclib: true, hijack: true }, readLS());
+  const settings = Object.assign({ offset: 0, offsets: {}, blur: true, lrclib: true, hijack: true }, readLS());
+  // sync offset is per song (a source can be late on one song and spot on for the next); the old
+  // single `offset` is the default for songs never adjusted
+  const songOffset = () => { const v = settings.offsets && settings.offsets[clock.uri]; return typeof v === 'number' ? v : settings.offset; };
   const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
 
   // ═════════════════════════ platform discovery ═════════════════════════
@@ -79,7 +82,8 @@
   // Spotify reports (positionAsOfTimestamp, timestamp[wall ms]). We convert once into the
   // performance.now() domain, which is the same clock document.timeline (and therefore the
   // compositor) uses — so animation startTimes land on the exact frame.
-  const clock = { pos: 0, at: 0, speed: 1, paused: true, uri: '', dur: 0, gen: 0 };
+  const clock = { pos: 0, at: 0, speed: 1, paused: true, uri: '', dur: 0, gen: 0, skew: 0 };
+  let lastStamp = 0;
 
   function readState(s) {
     // Spotify's timestamp is wall-clock (Date.now); map it into the performance.now() domain
@@ -89,15 +93,27 @@
     const paused = !!(s.isPaused || s.isBuffering);
     const speed = s.speed || 1;
     let pos = +s.positionAsOfTimestamp || 0;
-    if (!paused && s.timestamp) pos += (wall - +s.timestamp) * speed;
+    if (!paused && s.timestamp) {
+      // Spotify's stamps come from its own monotonic clock mapped to wall time once; when Windows
+      // later corrects its time (sync after sleep), Date.now() and the stamps disagree by that
+      // correction and every position is off by it. A fresh anchor (play, seek, next track)
+      // reaches us within milliseconds of its stamp, so a bigger lag on one is that disagreement.
+      const ts = +s.timestamp;
+      if (ts !== lastStamp) {
+        const lag = wall - ts;
+        if (lastStamp) clock.skew = Math.abs(lag) > 600 ? lag : 0; // first anchor may just be old
+        lastStamp = ts;
+      }
+      pos += (wall - ts - clock.skew) * speed;
+    }
     // never extrapolate outside the track (stale/odd states would otherwise jump to the last line)
     const dur = +s.duration || (s.item && s.item.duration && s.item.duration.milliseconds) || 0;
     pos = Math.max(0, dur ? Math.min(pos, dur) : pos);
     return { pos, at: perf, paused, speed };
   }
   const rawNow = (perf = performance.now()) => clock.pos + (clock.paused ? 0 : (perf - clock.at) * clock.speed);
-  const songNow = (perf) => rawNow(perf) + settings.offset;
-  const perfAt = (songMs) => clock.at + (songMs - settings.offset - clock.pos) / clock.speed;
+  const songNow = (perf) => rawNow(perf) + songOffset();
+  const perfAt = (songMs) => clock.at + (songMs - songOffset() - clock.pos) / clock.speed;
 
   // ═════════════════════════ workers ═════════════════════════
   let engine = null;
@@ -171,7 +187,7 @@
         <button class="fl-sync fl-btn-pill" data-act="resync" aria-label="Back to the current line">${ICON.sync}<span>Back to lyrics</span></button>
       </div>
       <div class="fl-pop" role="menu">
-        <div class="fl-row"><label>Sync offset</label><div class="fl-step">
+        <div class="fl-row"><label>Sync offset (this song)</label><div class="fl-step">
           <button class="fl-btn" data-act="off-" aria-label="Lyrics earlier">−</button><output></output>
           <button class="fl-btn" data-act="off+" aria-label="Lyrics later">+</button></div></div>
         <div class="fl-row"><label for="fl-tog-blur">Depth blur</label><input id="fl-tog-blur" class="fl-tog" type="checkbox" data-set="blur"></div>
@@ -211,6 +227,11 @@
       if (bgw) bgw.postMessage({ type: 'resize', w: root.clientWidth, h: root.clientHeight });
       if (view.items.length) { measure(); place(true); }
     }).observe(root);
+    // lines can change height without the viewer resizing (the lyric font arriving late, lines
+    // re-wrapping): stale offsets park the live line hundreds of px off its spot → re-measure
+    new ResizeObserver(() => {
+      if (view.items.length && view.offsets && view.items[0].el.isConnected) { measure(); place(true); }
+    }).observe(linesEl);
   }
 
   function setupBackground() {
@@ -288,6 +309,14 @@
     return `<span class="fl-w"><span class="fl-b">${t}</span><span class="fl-f" aria-hidden="true"><span class="fl-fi">${t}</span></span></span>`;
   }
 
+  const SYNC_NAME = {
+    word: 'Word-synced',
+    syllable: 'Syllable-synced',
+    'smart+audio': 'Word timing estimated from the audio',
+    smart: 'Word timing estimated',
+    static: 'Not synced',
+  };
+
   function render(data, trackId) {
     teardown();
     view.data = data;
@@ -302,9 +331,14 @@
     }
     showMsg('');
     let html = '';
+    // after the last line (so line i stays linesEl.children[i]): where these lyrics came from
+    const credit = data.source
+      ? `<div class="fl-credit">Lyrics by ${esc(data.source)}<small>${esc(SYNC_NAME[data.sync] || '')}</small></div>`
+      : '';
     if (data.kind === 'static') {
       for (const it of data.items) html += `<div class="fl-line" role="listitem"><span class="fl-main"><span class="fl-b">${esc(it.text) || '&nbsp;'}</span></span></div>`;
-      linesEl.innerHTML = html;
+      linesEl.innerHTML = html + credit;
+      view.credit = null;
       scrollerEl.scrollTop = 0;
       return;
     }
@@ -324,7 +358,8 @@
         + (bg.length ? `<span class="fl-bgv">${bg.map(wordHTML).join(' ')}</span>` : '')
         + '</div>';
     });
-    linesEl.innerHTML = html;
+    linesEl.innerHTML = html + credit;
+    view.credit = linesEl.querySelector('.fl-credit');
 
     const els = linesEl.children;
     view.starts = new Float64Array(items.length);
@@ -407,6 +442,11 @@
       s.setProperty('--fl-y', yPx);
       if (rec.d !== d) { s.setProperty('--fl-d', d); rec.d = d; }
       if (rec.k !== k) { s.setProperty('--fl-k', k); rec.k = k; }
+    }
+    if (view.credit) {
+      const s = view.credit.style;
+      s.transition = instant ? 'none' : '';
+      s.setProperty('--fl-y', yPx);
     }
     view.lastY = y;
   }
@@ -862,7 +902,12 @@
       else if (a === 'menu') popEl.classList.toggle('is-open');
       else if (a === 'resync') resync();
       else if (a === 'off-' || a === 'off+') {
-        settings.offset += a === 'off+' ? 50 : -50;
+        if (!settings.offsets || typeof settings.offsets !== 'object') settings.offsets = {};
+        const v = songOffset() + (a === 'off+' ? 50 : -50);
+        delete settings.offsets[clock.uri]; // re-insert → most recent last, oldest trimmed first
+        if (v !== settings.offset) settings.offsets[clock.uri] = v;
+        const keys = Object.keys(settings.offsets);
+        for (const k of keys.slice(0, Math.max(0, keys.length - 500))) delete settings.offsets[k];
         saveLS();
         syncSettingsUI();
         sync(true);
@@ -877,7 +922,7 @@
     if (line && view.data && view.data.kind === 'synced') {
       const rec = view.items[+line.dataset.i];
       if (!rec || rec.t === 'gap') return;
-      const target = Math.max(0, rec.s - settings.offset);
+      const target = Math.max(0, rec.s - songOffset());
       // optimistic: move our clock now so the UI responds this frame, the player event confirms
       clock.pos = target;
       clock.at = performance.now();
@@ -919,7 +964,8 @@
 
   function syncSettingsUI() {
     if (!root) return;
-    root.querySelector('.fl-step output').textContent = (settings.offset > 0 ? '+' : '') + settings.offset + ' ms';
+    const off = songOffset();
+    root.querySelector('.fl-step output').textContent = (off > 0 ? '+' : '') + off + ' ms';
     root.querySelectorAll('[data-set]').forEach((el) => (el.checked = !!settings[el.dataset.set]));
     const d = view.data;
     const SYNC = {
