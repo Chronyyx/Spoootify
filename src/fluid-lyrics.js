@@ -473,6 +473,7 @@
   // Re-timing on seek/pause/offset is just startTime / currentTime updates on existing objects.
 
   function timeAnim(rec) {
+    if (!rec.anims) return; // interlude dots armed but still waiting for their scale-in
     const playing = !clock.paused;
     for (const x of rec.anims) {
       const a = x.a;
@@ -748,7 +749,8 @@
     view.data = null;
     view.rendered = '';
     if (!root) return;
-    if (!tr || s.item.type === 'episode' || s.item.mediaType === 'video') {
+    // music videos are tracks too (mediaType 'video'); only podcast episodes have no lyrics
+    if (!tr || s.item.type === 'episode') {
       view.items = [];
       linesEl.innerHTML = '';
       showMsg(tr ? 'Lyrics are only available for songs' : 'Nothing playing');
@@ -1026,7 +1028,11 @@
     document.documentElement.style.setProperty('--fl-scroll-ms', sp0.ms + 'ms');
     startEngine();
     buildShell();
-    sp.player.getEvents().addListener('update', onPlayerUpdate);
+    // we run inside Spotify's own event dispatch: a throw here would also starve the listeners
+    // after us (its progress bar froze at 0:00), so never let one escape
+    sp.player.getEvents().addListener('update', () => {
+      try { onPlayerUpdate(); } catch (e) { console.error('[fluid-lyrics]', e); }
+    });
     try {
       const h = sp.platform && sp.platform.getHistory();
       if (h && h.listen) h.listen(() => isOpen && close());
